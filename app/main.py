@@ -25,7 +25,33 @@ app = FastAPI(title="vLLM Multi-LoRA Server", version="1.0.0")
 engine = VLLMMultiLoRAEngine(BASE_MODEL_PATH, MODEL_CONFIGS)
 
 # --- 미들웨어 설정 ---
-origins = ["*"]
+# 🔐 보안 강화: 명시적 도메인 목록 (다른 서버와 일치)
+origins = [
+    # EC2 서버 (공인 IP)
+    "http://3.13.240.111:3000",  # React Landing Page
+    "http://3.13.240.111:8000",  # Backend API
+    "http://3.13.240.111:8001",  # DB Module
+    "http://3.13.240.111:8002",  # vLLM Server (자기 자신)
+    "http://3.13.240.111:8003",  # Translator Service
+    
+    # 로컬 개발 환경
+    "http://localhost:3000",     # React 개발용
+    "http://localhost:8000",     # Backend API
+    "http://localhost:8001",     # DB Module
+    "http://localhost:8002",     # vLLM Server
+    "http://localhost:8003",     # Translator Service
+    
+    # 127.0.0.1 로컬호스트
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8001",
+    "http://127.0.0.1:8002",
+    "http://127.0.0.1:8003",
+    
+    # VSCode Extension 지원
+    "vscode://",                 # VSCode Extension
+    "vscode-webview://*"         # VSCode WebView
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
