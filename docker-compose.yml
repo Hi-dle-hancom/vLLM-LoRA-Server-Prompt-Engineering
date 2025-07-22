@@ -1,0 +1,212 @@
+version: "3.8"
+
+services:
+  # =================================================
+  # vLLM 서버
+  # =================================================
+  vllm-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hapa-vllm-server
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./app:/app/app
+      - /home/ubuntu/deepseek-coder/models:/lora_adapters
+      - /home/ubuntu/.cache/huggingface:/root/.cache/huggingface
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    networks:
+      - hapa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 90s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # =================================================
+  # 번역 서비스
+  # =================================================
+  translator:
+    build:
+      context: ../translator-service
+      dockerfile: Dockerfile
+    container_name: hapa-translator-service
+    ports:
+      - "8003:8003"
+    volumes:
+      - /home/ubuntu/.cache/huggingface:/root/.cache/huggingface
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    networks:
+      - hapa-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # =================================================
+  # Redis 캐시 서비스
+  # =================================================
+  redis:
+    image: redis:7.0-alpine
+    container_name: hapa-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - hapa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # =================================================
+  # MongoDB
+  # =================================================
+  mongodb:
+    image: mongo:7.0
+    container_name: hapa-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=hapa_mongodb_password
+      - MONGO_INITDB_DATABASE=hapa
+    command: ["mongod", "--quiet", "--bind_ip_all"]
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - hapa-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ping:1})' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # =================================================
+  # HAPA DB Module
+  # =================================================
+  db-module:
+    build:
+      context: ../DB-Module/DB-Module
+      dockerfile: Dockerfile
+    container_name: hapa-db-module
+    ports:
+      - "8001:8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    #env_file:
+    #  - .env.${ENVIRONMENT:-development}
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=DEBUG
+      - DATABASE_URL=${DATABASE_URL:-postgresql://devk1212gh:1212@host.docker.internal:5432/hidle?options=-csearch_path%3Dhidle,public}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MONGODB_URL=${MONGODB_URL:-mongodb://admin:hapa_mongodb_password@mongodb:27017/hapa?authSource=admin}
+      - JWT_SECRET_KEY=HAPA_UNIFIED_SECRET_KEY_FOR_DEVELOPMENT_ONLY_CHANGE_IN_PRODUCTION_32CHARS
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      - REFRESH_TOKEN_EXPIRE_DAYS=${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+    depends_on:
+      - redis
+      - mongodb
+    networks:
+      - hapa-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: false # Python 앱이므로 임시 파일 쓰기 필요
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+
+  # =================================================
+  # HAPA Backend
+  # =================================================
+  backend:
+    build:
+      context: ../Backend
+      dockerfile: Dockerfile
+    container_name: hapa-backend-api
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    #env_file:
+    #  - .env.${ENVIRONMENT:-development}
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - VLLM_SERVER_URL=http://vllm-app:8002
+      - DATABASE_URL=${DATABASE_URL:-postgresql://devk1212gh:1212@host.docker.internal:5432/hidle}
+      - REDIS_URL=redis://redis:6379
+      - DB_MODULE_URL=http://db-module:8001
+      - MONGODB_URL=${MONGODB_URL:-mongodb://admin:hapa_mongodb_password@mongodb:27017/hapa?authSource=admin}
+      - SECRET_KEY=${SECRET_KEY:-hapa_dev_secret_key_not_for_production}
+      - JWT_SECRET_KEY=HAPA_UNIFIED_SECRET_KEY_FOR_DEVELOPMENT_ONLY_CHANGE_IN_PRODUCTION_32CHARS
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      - REFRESH_TOKEN_EXPIRE_DAYS=${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      - ENABLE_DEMO_API_KEY=${ENABLE_DEMO_API_KEY:-true}
+      - DEMO_API_KEY=${DEMO_API_KEY:-hapa_demo_20241228_secure_key_for_testing}
+    depends_on:
+      - vllm-app
+      - redis
+      - db-module
+    networks:
+      - hapa-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: false # Python 앱이므로 임시 파일 쓰기 필요
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+
+# =================================================
+# 🔐 Docker Secrets 정의
+# =================================================
+secrets:
+  jwt_secret:
+    file: ./secrets/jwt_secret_${ENVIRONMENT:-development}.key
+
+# =================================================
+# 네트워크 및 볼륨
+# =================================================
+networks:
+  hapa-network:
+    driver: bridge
+
+volumes:
+  redis_data:
+    driver: local
+  mongodb_data:
+    driver: local
+  mongodb_logs:
+    driver: local

@@ -1,0 +1,9 @@
+fastapi
+pydantic
+uvicorn[standard]
+vllm
+transformers
+torch
+prometheus-fastapi-instrumentator
+prometheus-client
+httpx
