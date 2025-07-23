@@ -28,21 +28,31 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         name="autocomplete",
         adapter_path="/lora_adapters/autocomplete-finetuned/final_model",
         lora_id=1,
-        max_tokens=128,
+        max_tokens=64,  # 자동완성은 더 짧게
         temperature=0.3,
         top_p=0.9,
-        system_prompt="You are an expert python code completion engine.Always end your response with the exact line: # --- Generation Complete ---",
-        stop=["<|EOT|>", "<|fim_end|>", "\n# --- Generation Complete ---"]
+        system_prompt="You are an expert python code completion engine. Complete the code concisely. Always end your response with the exact line: # --- Generation Complete ---",
+        stop=[
+            "<|EOT|>", 
+            "<|fim_end|>", 
+            "<|im_end|>",
+            "# --- Generation Complete ---"
+        ]
     ),
     "prompt": ModelConfig(
         name="prompt",
         adapter_path="/lora_adapters/prompt-finetuned/final_model",
         lora_id=2,
-        max_tokens=1024,
+        max_tokens=512,  # 너무 긴 응답 방지
         temperature=0.6,
         top_p=0.95,
-        system_prompt="You are a helpful senior Python developer.Always end your response with the exact line: # --- Generation Complete ---",
-        stop=["<|EOT|>", "<|fim_end|>", "\n# --- Generation Complete ---"]
+        system_prompt="You are a helpful senior Python developer. Provide concise, working Python code. Always end your response with the exact line: # --- Generation Complete ---",
+        stop=[
+            "<|EOT|>", 
+            "<|fim_end|>", 
+            "<|im_end|>",
+            "# --- Generation Complete ---"
+        ]
     ),
     "comment": ModelConfig(
         name="comment",
@@ -51,8 +61,13 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         max_tokens=256,
         temperature=0.4,
         top_p=0.9,
-        system_prompt="You are a python code documentation assistant.Always end your response with the exact line: # --- Generation Complete ---",
-        stop=["<|EOT|>", "<|fim_end|>", "\n# --- Generation Complete ---"]
+        system_prompt="You are a python code documentation assistant. Provide concise comments and docstrings. Always end your response with the exact line: # --- Generation Complete ---",
+        stop=[
+            "<|EOT|>", 
+            "<|fim_end|>", 
+            "<|im_end|>",
+            "# --- Generation Complete ---"
+        ]
     ),
     "error_fix": ModelConfig(
         name="error_fix",
@@ -61,7 +76,12 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         max_tokens=512,
         temperature=0.5,
         top_p=0.9,
-        system_prompt="You are a python debugging expert.Always end your response with the exact line: # --- Generation Complete ---",
-        stop=["<|EOT|>", "<|fim_end|>", "\n# --- Generation Complete ---"]
+        system_prompt="You are a python debugging expert. Provide concise bug fixes and explanations. Always end your response with the exact line: # --- Generation Complete ---",
+        stop=[
+            "<|EOT|>", 
+            "<|fim_end|>", 
+            "<|im_end|>",
+            "# --- Generation Complete ---"
+        ]
     ),
 }

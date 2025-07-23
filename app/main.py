@@ -124,7 +124,13 @@ async def generate_stream(request_data: StreamGenerateRequest):
 
         return StreamingResponse(
             engine.generate_stream(request_data),
-            media_type="text/event-stream"
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Transfer-Encoding": "chunked",
+                "Access-Control-Allow-Origin": "*"
+            }
         )
     except Exception as e:
         logger.error(f"❌ 스트리밍 중 오류 발생: {e}", exc_info=True)
