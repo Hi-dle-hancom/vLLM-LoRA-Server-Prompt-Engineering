@@ -280,10 +280,16 @@ Remember: Focus on robust, error-free solutions.
         )
         
         # FIM 태그 인식을 위한 로깅
-        logger.info(f"Stop tokens for {request.model_type}: {config.stop}")
-
-        lora_request = LoRARequest(lora_name=config.name, lora_int_id=config.lora_id, lora_path=config.adapter_path)
+        logger.info(f"Stop tokens for {request.model_type}: {config.stop or []}")
+        
+        # request_id 생성 (사용 전에 먼저 정의)
         request_id = f"stream-{int(time.time() * 1000)}"
+        
+        # 스트리밍 생성 시작
+        logger.info(f"스트리밍 생성 시작: request_id={request_id}")
+        last_text = ""
+        token_count = 0
+        lora_request = LoRARequest(lora_name=config.name, lora_int_id=config.lora_id, lora_path=config.adapter_path)
         results_generator = self.engine.generate(final_prompt, sampling_params, request_id, lora_request)
 
         # ✨ 강화된 스탑 토큰 감지 로직
@@ -291,10 +297,13 @@ Remember: Focus on robust, error-free solutions.
         buffer = ""  # 부분 스탑 토큰 감지를 위한 버퍼
         
         async for request_output in results_generator:
+            token_count += 1
             text_so_far = request_output.outputs[0].text
             buffer += text_so_far[len(last_text):]
             
-            # 1. 완전한 스탑 토큰 체크
+            logger.debug(f"Token #{token_count}: text_length={len(text_so_far)}, new_text='{text_so_far[len(last_text):][:30]}...'")
+            
+            # 1. 완전한 스톱 토큰 체크
             stop_found = False
             stop_str_found = ""
             for stop_str in (config.stop or []):
@@ -302,7 +311,7 @@ Remember: Focus on robust, error-free solutions.
                     text_so_far = text_so_far.split(stop_str)[0]
                     stop_found = True
                     stop_str_found = stop_str
-                    logger.info(f"완전한 스탑 토큰 '{stop_str_found}' 감지됨")
+                    logger.info(f"완전한 스톱 토큰 '{stop_str_found}' 감지됨")
                     break
             
             # 2. 부분 스탑 토큰 체크 (간소화)
@@ -312,7 +321,12 @@ Remember: Focus on robust, error-free solutions.
             delta = text_so_far[len(last_text):]
             if delta and not stop_found:
                 # 델타 필터링 비활성화 - 모든 델타 전송
+                logger.info(f"델타 전송: '{delta[:50]}...'")
                 yield f"data: {json.dumps({'text': delta})}\n\n"
+            elif not delta:
+                logger.debug("델타 없음 - 전송 건너뛰기")
+            elif stop_found:
+                logger.debug(f"스톱 토큰 발견로 델타 전송 중단: '{delta[:30]}...'")
             
             last_text = text_so_far
             
@@ -327,17 +341,21 @@ Remember: Focus on robust, error-free solutions.
                 logger.info(f"최대 토큰 수({request.max_tokens}) 도달로 스트림 종료")
                 break
                 
-            # 5-2. 문자 수 기반 종료 (모델 타입별) - 제한 완화
+            # 5-2. 문자 수 기반 종료 (모델 타입별) - 더 긴 응답 허용
             max_chars = {
-                "autocomplete": 1000,
-                "prompt": 4000, 
-                "comment": 1500,
-                "error_fix": 3000
-            }.get(request.model_type, 2000)
+                "autocomplete": 2000,   # 1000 → 2000
+                "prompt": 8000,        # 4000 → 8000 (더 긴 코드 생성)
+                "comment": 3000,       # 1500 → 3000
+                "error_fix": 6000      # 3000 → 6000
+            }.get(request.model_type, 4000)  # 기본값도 2000 → 4000
             
             if len(text_so_far) >= max_chars:
-                logger.info(f"최대 문자 수({max_chars}) 도달로 스트림 종료")
+                logger.info(f"문자 수 제한({max_chars}) 도달로 스트림 종료 (current={len(text_so_far)})")
                 break
+            
+            # 주기적인 진행 상황 로그
+            if token_count % 10 == 0:
+                logger.debug(f"진행 상황: tokens={token_count}, chars={len(text_so_far)}, max_chars={max_chars}")
                 
             # 5-3. 연속 동일 내용 반복 감지 (완화)
             if len(last_text) > 100:  # 더 긴 텍스트에서만 체크
@@ -369,6 +387,7 @@ Remember: Focus on robust, error-free solutions.
             #             return
 
         # 정상 종료 시 완료 신호 전송
+        logger.info(f"스트리밍 정상 종료 - 완료 신호 전송 (token_count={token_count})")
         yield f"data: {json.dumps({'type': 'done', 'text': ''})}\n\n"
 
     async def generate_single(self, request: GenerateRequest) -> Dict[str, Any]:

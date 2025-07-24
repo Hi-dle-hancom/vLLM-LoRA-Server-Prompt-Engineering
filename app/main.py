@@ -114,6 +114,8 @@ async def generate(request_data: GenerateRequest):
 @app.post("/generate/stream", tags=["Generation"])
 async def generate_stream(request_data: StreamGenerateRequest):
     """스트리밍 방식으로 응답을 생성합니다."""
+    logger.info(f"vLLM 스트리밍 요청 수신: user_id={request_data.user_id}, model_type={request_data.model_type}, prompt='{request_data.prompt[:50]}...'")
+    
     try:
         if request_data.model_type not in MODEL_CONFIGS:
              # 스트리밍 응답에서도 오류를 JSON 형태로 반환할 수 있도록 처리
@@ -122,6 +124,8 @@ async def generate_stream(request_data: StreamGenerateRequest):
                 yield f"data: {json.dumps({'error': error_msg})}\n\n"
             return StreamingResponse(error_stream(), media_type="text/event-stream", status_code=400)
 
+        logger.info(f"vLLM 스트리밍 응답 시작: {request_data.model_type} 모델로 생성 시작")
+        
         return StreamingResponse(
             engine.generate_stream(request_data),
             media_type="text/event-stream",
