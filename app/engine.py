@@ -292,52 +292,36 @@ Remember: Focus on robust, error-free solutions.
         lora_request = LoRARequest(lora_name=config.name, lora_int_id=config.lora_id, lora_path=config.adapter_path)
         results_generator = self.engine.generate(final_prompt, sampling_params, request_id, lora_request)
 
-        # ✨ 강화된 스탑 토큰 감지 로직
-        last_text = ""
-        buffer = ""  # 부분 스탑 토큰 감지를 위한 버퍼
-        
+        # ✨ 스트리밍 생성 루프
         async for request_output in results_generator:
             token_count += 1
-            text_so_far = request_output.outputs[0].text
-            buffer += text_so_far[len(last_text):]
+            current_text = request_output.outputs[0].text
             
-            logger.debug(f"Token #{token_count}: text_length={len(text_so_far)}, new_text='{text_so_far[len(last_text):][:30]}...'")
-            
-            # 1. 완전한 스톱 토큰 체크
+            # 1. 스톱 토큰 체크
             stop_found = False
-            stop_str_found = ""
             for stop_str in (config.stop or []):
-                if stop_str in text_so_far:
-                    text_so_far = text_so_far.split(stop_str)[0]
+                if stop_str in current_text:
+                    current_text = current_text.split(stop_str)[0]
                     stop_found = True
-                    stop_str_found = stop_str
-                    logger.info(f"완전한 스톱 토큰 '{stop_str_found}' 감지됨")
+                    logger.info(f"스톱 토큰 '{stop_str}' 감지됨")
                     break
             
-            # 2. 부분 스탑 토큰 체크 (간소화)
-            # 부분 스탑 토큰 감지 비활성화 - 단순하게 완전한 스탑 토큰만 처리
+            # 2. 델타 계산 (중복 방지)
+            delta = current_text[len(last_text):] if len(current_text) > len(last_text) else ""
             
-            # 3. 델타 계산 및 전송 (간소화)
-            delta = text_so_far[len(last_text):]
+            # 3. 델타 전송
             if delta and not stop_found:
-                # 델타 필터링 비활성화 - 모든 델타 전송
                 logger.info(f"델타 전송: '{delta[:50]}...'")
                 yield f"data: {json.dumps({'text': delta})}\n\n"
-            elif not delta:
-                logger.debug("델타 없음 - 전송 건너뛰기")
-            elif stop_found:
-                logger.debug(f"스톱 토큰 발견로 델타 전송 중단: '{delta[:30]}...'")
+                last_text = current_text  # 중요: 전송 후 업데이트
             
-            last_text = text_so_far
-            
-            # 4. 스탑 조건 체크
+            # 4. 종료 조건 체크
             if stop_found:
-                logger.info(f"스트림 종료: '{stop_str_found}' 감지")
+                logger.info("스톱 토큰으로 스트림 종료")
                 break
                 
-            # 5. 다양한 종료 조건 체크
             # 5-1. 최대 토큰 수 체크
-            if len(text_so_far.split()) >= request.max_tokens:
+            if len(current_text.split()) >= request.max_tokens:
                 logger.info(f"최대 토큰 수({request.max_tokens}) 도달로 스트림 종료")
                 break
                 
@@ -349,42 +333,13 @@ Remember: Focus on robust, error-free solutions.
                 "error_fix": 6000      # 3000 → 6000
             }.get(request.model_type, 4000)  # 기본값도 2000 → 4000
             
-            if len(text_so_far) >= max_chars:
-                logger.info(f"문자 수 제한({max_chars}) 도달로 스트림 종료 (current={len(text_so_far)})")
+            if len(current_text) >= max_chars:
+                logger.info(f"문자 수 제한({max_chars}) 도달로 스트림 종료 (current={len(current_text)})")
                 break
             
             # 주기적인 진행 상황 로그
             if token_count % 10 == 0:
-                logger.debug(f"진행 상황: tokens={token_count}, chars={len(text_so_far)}, max_chars={max_chars}")
-                
-            # 5-3. 연속 동일 내용 반복 감지 (완화)
-            if len(last_text) > 100:  # 더 긴 텍스트에서만 체크
-                recent_text = last_text[-100:]  # 더 긴 패턴 체크
-                if recent_text in text_so_far[:-100] and len(text_so_far) > 300:  # 더 엄격한 조건
-                    logger.info("반복 내용 감지로 스트림 종료")
-                    break
-                    
-            # 5-4. 패턴 기반 강제 종료 (비활성화)
-            # explanation_patterns = [
-            #     "\n\nThis code", "\n\nThe above", "\n\nHere's", "\n\nLet me",
-            #     "\n\nExplanation:", "\n\nNote:", "\n\nRemember", "\n\nI hope",
-            #     "\n\n이 코드", "\n\n위 코드", "\n\n설명:", "\n\n참고:"
-            # ]
-            # 
-            # for pattern in explanation_patterns:
-            #     if pattern.lower() in text_so_far.lower():
-            #         # 설명 시작 전까지만 자르기
-            #         cut_index = text_so_far.lower().find(pattern.lower())
-            #         if cut_index > 0:
-            #             text_so_far = text_so_far[:cut_index].strip()
-            #             logger.info(f"설명 패턴 '{pattern}' 감지 - 코드부분만 유지")
-            #             # 마지막 델타 전송 후 종료
-            #             final_delta = text_so_far[len(last_text):]
-            #             if final_delta:
-            #                 yield f"data: {json.dumps({'text': final_delta})}\n\n"
-            #             # 스트림 완료 신호 전송
-            #             yield f"data: {json.dumps({'type': 'done', 'text': ''})}\n\n"
-            #             return
+                logger.debug(f"진행 상황: tokens={token_count}, chars={len(current_text)}, max_chars={max_chars}")
 
         # 정상 종료 시 완료 신호 전송
         logger.info(f"스트리밍 정상 종료 - 완료 신호 전송 (token_count={token_count})")
@@ -405,18 +360,29 @@ Remember: Focus on robust, error-free solutions.
 
         full_text = ""
         async for chunk in self.generate_stream(stream_request):
-            if chunk.strip() == "data: [DONE]":
+            # 새로운 JSON 형식 완료 신호 처리
+            if chunk.strip().startswith("data: "):
+                try:
+                    data_str = chunk.strip()[5:].strip()
+                    if data_str:
+                        data = json.loads(data_str)
+                        
+                        # 완료 신호 체크
+                        if data.get("type") == "done":
+                            logger.info("스트림 완료 신호 수신")
+                            break
+                            
+                        # 텍스트 데이터 처리
+                        if "text" in data and data["text"]:
+                            full_text += data["text"]
+                        elif "error" in data:
+                            logger.error(f"스트림에서 오류 수신: {data['error']}")
+                            return {'error': data['error']}
+                except json.JSONDecodeError:
+                    logger.warning(f"스트림에서 JSON 디코딩 오류 발생: {chunk}")
+                    continue
+            # 구식 [DONE] 신호 호환성 유지
+            elif chunk.strip() == "data: [DONE]":
+                logger.info("구식 [DONE] 신호 수신")
                 break
-            try:
-                data_str = chunk.strip()[5:].strip()
-                if data_str:
-                    data = json.loads(data_str)
-                    if "text" in data:
-                        full_text += data["text"]
-                    elif "error" in data:
-                        logger.error(f"스트림에서 오류 수신: {data['error']}")
-                        return {'error': data['error']}
-            except json.JSONDecodeError:
-                logger.warning(f"스트림에서 JSON 디코딩 오류 발생: {chunk}")
-                continue
         return {'generated_text': full_text}
