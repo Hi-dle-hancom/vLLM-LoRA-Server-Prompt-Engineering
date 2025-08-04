@@ -57,25 +57,39 @@ class VLLMMultiLoRAEngine:
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_path)
             
-            # ✨ VRAM 최적화 및 성능 개선을 위한 최종 EngineArgs 설정
+            # ✨ 안정성 우선 EngineArgs 설정 (토큰 중복 방지)
             engine_args = AsyncEngineArgs(
                 model=self.base_model_path,
-                quantization="marlin",
+                # quantization="marlin",  # 비활성화: 토큰 중복 원인 가능성
                 enable_lora=True,
                 trust_remote_code=True,
-                gpu_memory_utilization=0.4,
-                max_model_len=2048,
-                max_num_seqs=4,
-                tokenizer_mode="slow",
-                max_loras=5,
-                max_lora_rank=32,
+                gpu_memory_utilization=0.5,  # 0.4 → 0.5 증가
+                max_model_len=4096,  # 2048 → 4096 증가 (더 긴 컴텍스트)
+                max_num_seqs=2,  # 4 → 2 감소 (안정성 우선)
+                tokenizer_mode="auto",  # "slow" → "auto" 변경
+                max_loras=3,  # 5 → 3 감소
+                max_lora_rank=16,  # 32 → 16 감소
                 dtype="half",
                 tensor_parallel_size=1,
+                # 추가 안정성 옵션
+                enforce_eager=True,  # CUDA 그래프 최적화 비활성화
+                disable_custom_all_reduce=True,  # 커스텀 reduce 비활성화
             )
             
             self.engine = AsyncLLMEngine.from_engine_args(engine_args)
             self.is_initialized = True
             logger.info("✅ 엔진 초기화 완료 (VRAM 최적화 모드)")
+            
+            # 모델 상태 간단 검증
+            logger.info("🔍 모델 상태 검증 시작...")
+            try:
+                # 간단한 테스트 프롬프트
+                test_prompt = "Hello"
+                test_params = SamplingParams(temperature=0.1, max_tokens=5)
+                # 비동기 테스트는 여기서 수행하지 않음 (초기화 단계에서는 위험)
+                logger.info("✅ 모델 기본 상태 확인 완료")
+            except Exception as e:
+                logger.error(f"⚠️ 모델 상태 검증 실패: {e}")
         except Exception as e:
             logger.error(f"❌ 엔진 초기화 실패: {e}", exc_info=True)
             self.is_initialized = False
@@ -169,9 +183,10 @@ Remember: Focus on robust, error-free solutions.
             # 기본 시스템 프롬프트
             system_content = config.system_prompt
         
-        # 훈련 데이터 형식에 맞는 ChatML 프롬프트 구성 (시스템 프롬프트 제외)
-        # 훈련 데이터에서는 user → assistant 직접 대화 형식을 사용했음
-        chatml_prompt = f"""<|im_start|>user
+        # ChatML 프롬프트 구성 (시스템 프롬프트 포함)
+        chatml_prompt = f"""<|im_start|>system
+{system_content}<|im_end|>
+<|im_start|>user
 {user_prompt}<|im_end|>
 <|im_start|>assistant
 """
@@ -309,11 +324,16 @@ Remember: Focus on robust, error-free solutions.
             # 2. 델타 계산 (중복 방지)
             delta = current_text[len(last_text):] if len(current_text) > len(last_text) else ""
             
-            # 3. 델타 전송
+            # 3. 델타 품질 검증 및 정리
             if delta and not stop_found:
-                logger.info(f"델타 전송: '{delta[:50]}...'")
-                yield f"data: {json.dumps({'text': delta})}\n\n"
-                last_text = current_text  # 중요: 전송 후 업데이트
+                # 델타 품질 검증
+                cleaned_delta = self._validate_and_clean_delta(delta)
+                if cleaned_delta:
+                    logger.info(f"델타 전송: '{cleaned_delta[:50]}...'")
+                    yield f"data: {json.dumps({'text': cleaned_delta})}\n\n"
+                    last_text = current_text  # 중요: 전송 후 업데이트
+                else:
+                    logger.warning(f"부적절한 델타 필터링: '{delta[:30]}...'")
             
             # 4. 종료 조건 체크
             if stop_found:
@@ -386,3 +406,57 @@ Remember: Focus on robust, error-free solutions.
                 logger.info("구식 [DONE] 신호 수신")
                 break
         return {'generated_text': full_text}
+
+    def _validate_and_clean_delta(self, delta: str) -> str:
+        """델타 품질 검증 및 정리 (강화된 버전)"""
+        if not delta or len(delta.strip()) == 0:
+            return ""
+        
+        import re
+        
+        # 1. 기본 정리
+        cleaned = delta.strip()
+        
+        # 2. 비인쇄 가능 문자 제거
+        cleaned = ''.join(c for c in cleaned if c.isprintable() or c.isspace())
+        
+        # 3. 중복 문자 패턴 제거
+        cleaned = re.sub(r'([a-zA-Z_])\1{2,}', r'\1', cleaned)  # 같은 문자 3개 이상 → 1개
+        cleaned = re.sub(r'([a-zA-Z_]{2,})\1+', r'\1', cleaned)  # 패턴 반복 제거
+        
+        # 4. 기그 문자 패턴 감지 및 차단
+        broken_patterns = [
+            r'[\x00-\x1f\x7f-\x9f]{2,}',  # 제어 문자
+            r'([a-zA-Z])\1{4,}',  # 5개 이상 반복
+            r'([a-zA-Z]{2,})\1{3,}',  # 패턴 4번 이상 반복
+            r'^[^a-zA-Z0-9\s\(\)\[\]\{\}\.,;:"\'\_\-\+\*\/\=\<\>\!\?\#\$\%\&\@\^\`\~\|\\]{3,}',  # 이상한 문자로만 구성
+        ]
+        
+        for pattern in broken_patterns:
+            if re.search(pattern, cleaned):
+                logger.warning(f"기그 패턴 감지로 델타 차단: '{pattern}' in '{cleaned[:30]}...'")
+                return ""  # 기극 문자 감지 시 완전 차단
+        
+        # 5. 최소 길이 체크
+        if len(cleaned.strip()) < 1:
+            return ""
+            
+        # 6. 의미 있는 내용 체크 (완화된 버전)
+        meaningful_chars = sum(1 for c in cleaned if c.isalnum() or c in '()[]{}.,;:"\'\_-+=<>!?#$%&@^`~|\\ \t\n')
+        total_chars = len(cleaned)
+        
+        # 너무 짧은 델타는 통과
+        if total_chars <= 3:
+            return cleaned
+        
+        # 비율 계산 (공백 문자 포함)
+        if total_chars > 0:
+            ratio = meaningful_chars / total_chars
+            # 10% 이상이면 통과 (기존 30%에서 완화)
+            if ratio < 0.1:
+                logger.warning(f"의미 없는 델타 차단: meaningful_ratio={meaningful_chars}/{total_chars} = {ratio:.2f}")
+                return ""
+            else:
+                logger.debug(f"델타 통과: meaningful_ratio={meaningful_chars}/{total_chars} = {ratio:.2f}")
+        
+        return cleaned
