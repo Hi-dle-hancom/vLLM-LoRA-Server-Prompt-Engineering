@@ -55,25 +55,48 @@ class VLLMMultiLoRAEngine:
         """vLLM 비동기 엔진과 토크나이저를 초기화합니다."""
         logger.info("🚀 vLLM 비동기 엔진 및 토크나이저 초기화 중 (VRAM 최적화 모드)...")
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_path)
+            # 🛡️ 안전한 토크나이저 초기화 (바이트 경계 오류 방지)
+            logger.info(f"토크나이저 로딩 시작: {self.base_model_path}")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.base_model_path,
+                trust_remote_code=True,
+                use_fast=False,  # Fast 토크나이저 비활성화 (안정성 우선)
+                padding_side="left",  # 패딩 방향 명시
+                truncation_side="left",  # 잘림 방향 명시
+                clean_up_tokenization_spaces=True,  # 토큰화 공백 정리
+            )
             
-            # ✨ 안정성 우선 EngineArgs 설정 (토큰 중복 방지)
+            # 🔧 토크나이저 안전성 설정
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                logger.info("pad_token을 eos_token으로 설정")
+            
+            if self.tokenizer.unk_token is None:
+                self.tokenizer.unk_token = "<unk>"
+                logger.info("unk_token 설정")
+                
+            logger.info(f"✅ 토크나이저 로딩 완료: vocab_size={self.tokenizer.vocab_size}")
+            
+            # ✨ 극도로 보수적인 안전 설정 (텍스트 손상 방지)
             engine_args = AsyncEngineArgs(
                 model=self.base_model_path,
-                # quantization="marlin",  # 비활성화: 토큰 중복 원인 가능성
+                # quantization 명시적 비활성화 (토큰 손상 방지)
+                quantization=None,  # 명시적 None 설정
                 enable_lora=True,
                 trust_remote_code=True,
-                gpu_memory_utilization=0.5,  # 0.4 → 0.5 증가
-                max_model_len=4096,  # 2048 → 4096 증가 (더 긴 컴텍스트)
-                max_num_seqs=2,  # 4 → 2 감소 (안정성 우선)
-                tokenizer_mode="auto",  # "slow" → "auto" 변경
-                max_loras=3,  # 5 → 3 감소
-                max_lora_rank=16,  # 32 → 16 감소
-                dtype="half",
+                gpu_memory_utilization=0.4,  # 비양자화 모델에 맞게 감소
+                max_model_len=1536,  # 비양자화 모델에 맞게 감소
+                max_num_seqs=1,  # 단일 시퀀스 유지
+                tokenizer_mode="slow",  # auto → slow (바이트 경계 오류 방지)
+                max_loras=2,  # 4 → 2 최소화 (메모리 안정성)
+                max_lora_rank=16,  # 8 → 16 수정 (실제 모델 랜크와 일치)
+                dtype="half",  # float32 → half 복원 (호환성 우선)
                 tensor_parallel_size=1,
-                # 추가 안정성 옵션
-                enforce_eager=True,  # CUDA 그래프 최적화 비활성화
+                # 최대 안정성 옵션
+                enforce_eager=True,  # CUDA 그래프 완전 비활성화
                 disable_custom_all_reduce=True,  # 커스텀 reduce 비활성화
+                swap_space=4,  # 스왈 공간 추가 (메모리 안정성)
+                # 모든 최적화 비활성화
             )
             
             self.engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -96,9 +119,47 @@ class VLLMMultiLoRAEngine:
             raise
 
     def _build_chatml_prompt(self, config: ModelConfig, user_prompt: str, model_type: str) -> str:
-        """ChatML 형식으로 프롬프트를 구성합니다."""
+        """ChatML 또는 FIM 형식으로 프롬프트를 구성합니다 (학습 데이터 형식 준수)."""
         
-        # FIM 태그 감지 및 특별 처리
+        # 모델별 프롬프트 형식 결정
+        is_fim_model = model_type in ["autocomplete", "comment"]
+        is_fim_request = "<｜fim begin｜>" in user_prompt or "<|fim_begin|>" in user_prompt
+        
+        # FIM 모델이거나 FIM 요청인 경우 FIM 형식 사용
+        if is_fim_model or is_fim_request:
+            logger.info(f"FIM 형식 사용 - 모델: {model_type}, FIM 요청: {is_fim_request}")
+            return self._build_fim_prompt(user_prompt, model_type)
+        
+        # ChatML 모델은 ChatML 형식 사용
+        logger.info(f"ChatML 형식 사용 - 모델: {model_type}")
+        return self._build_chatML_format(config, user_prompt, model_type)
+    
+    def _build_fim_prompt(self, user_prompt: str, model_type: str) -> str:
+        """FIM (Fill-in-Middle) 형식 프롬프트 구성 (자동완성/주석 전용)."""
+        
+        # FIM 태그가 이미 있는 경우 그대로 사용
+        if "<|fim_begin|>" in user_prompt or "<｜fim begin｜>" in user_prompt:
+            enhanced_prompt = self._enhance_fim_prompt(user_prompt)
+            return enhanced_prompt
+        
+        # 일반 텍스트를 FIM 형식으로 변환
+        if model_type == "autocomplete":
+            # 자동완성: 코드 뒤에 커서 위치 설정
+            fim_prompt = f"<|fim_begin|>{user_prompt}<|fim_hole|><|fim_end|>"
+        elif model_type == "comment":
+            # 주석: 코드 위에 주석 삽입 위치 설정
+            fim_prompt = f"<|fim_begin|><|fim_hole|>\n{user_prompt}<|fim_end|>"
+        else:
+            # 기본: 일반 FIM 형식
+            fim_prompt = f"<|fim_begin|>{user_prompt}<|fim_hole|><|fim_end|>"
+        
+        logger.debug(f"FIM 프롬프트 생성: {fim_prompt[:100]}...")
+        return fim_prompt
+    
+    def _build_chatML_format(self, config: ModelConfig, user_prompt: str, model_type: str) -> str:
+        """ChatML 형식 프롬프트 구성 (prompt, error_fix 전용)."""
+        
+        # FIM 태그 감지 및 특별 처리 (기존 코드 유지)
         is_fim_request = "<｜fim begin｜>" in user_prompt or "<|fim_begin|>" in user_prompt
         
         if is_fim_request:
@@ -281,18 +342,30 @@ Remember: Focus on robust, error-free solutions.
         # 토큰 ID 기반 스탑 토큰 계산
         stop_token_ids = self._get_stop_token_ids(config.stop or [])
         
+        # 🛡️ 극도로 안전한 SamplingParams (메모리 손상 방지)
+        safe_temperature = max(0.1, min(1.0, request.temperature if request.temperature is not None else config.temperature))
+        safe_top_p = max(0.1, min(1.0, request.top_p if request.top_p is not None else config.top_p))
+        safe_max_tokens = min(512, max(1, request.max_tokens))  # 토큰 수 제한
+        
         sampling_params = SamplingParams(
-            temperature=request.temperature if request.temperature is not None else config.temperature,
-            top_p=request.top_p if request.top_p is not None else config.top_p,
-            max_tokens=request.max_tokens,
+            temperature=safe_temperature,
+            top_p=safe_top_p,
+            max_tokens=safe_max_tokens,
             stop=config.stop or [],
-            stop_token_ids=stop_token_ids,  # 토큰 ID 기반 스탑
-            repetition_penalty=1.3,  # 반복 방지 더 강화
-            frequency_penalty=0.2,   # 빈도 기반 페널티 증가
-            presence_penalty=0.2,    # 존재 기반 페널티 증가
-            include_stop_str_in_output=False,  # stop 토큰을 출력에서 제외
-            skip_special_tokens=False  # 특수 토큰 유지
+            stop_token_ids=stop_token_ids,
+            repetition_penalty=1.1,  # 1.3 → 1.1 완화 (안정성)
+            frequency_penalty=0.1,   # 0.2 → 0.1 완화 (안정성)
+            presence_penalty=0.1,    # 0.2 → 0.1 완화 (안정성)
+            include_stop_str_in_output=False,
+            skip_special_tokens=True,  # False → True (특수 토큰 제거로 안정성)
+            # 추가 안전성 옵션
+            logprobs=None,  # logprobs 비활성화
+            prompt_logprobs=None,  # prompt logprobs 비활성화
+            detokenize=True,  # 디토큰화 활성화
+            spaces_between_special_tokens=True,  # 특수 토큰 간 공백
         )
+        
+        logger.info(f"안전한 샘플링 파라미터: temp={safe_temperature}, top_p={safe_top_p}, max_tokens={safe_max_tokens}")
         
         # FIM 태그 인식을 위한 로깅
         logger.info(f"Stop tokens for {request.model_type}: {config.stop or []}")
@@ -307,63 +380,116 @@ Remember: Focus on robust, error-free solutions.
         lora_request = LoRARequest(lora_name=config.name, lora_int_id=config.lora_id, lora_path=config.adapter_path)
         results_generator = self.engine.generate(final_prompt, sampling_params, request_id, lora_request)
 
-        # ✨ 스트리밍 생성 루프
-        async for request_output in results_generator:
-            token_count += 1
-            current_text = request_output.outputs[0].text
-            
-            # 1. 스톱 토큰 체크
-            stop_found = False
-            for stop_str in (config.stop or []):
-                if stop_str in current_text:
-                    current_text = current_text.split(stop_str)[0]
-                    stop_found = True
-                    logger.info(f"스톱 토큰 '{stop_str}' 감지됨")
+        # 🛡️ 극도로 안전한 스트리밍 루프 (메모리 손상 방지)
+        max_iterations = 1000  # 무한 루프 방지
+        iteration_count = 0
+        
+        try:
+            async for request_output in results_generator:
+                iteration_count += 1
+                if iteration_count > max_iterations:
+                    logger.error(f"최대 반복 수({max_iterations}) 초과로 스트림 종료")
                     break
-            
-            # 2. 델타 계산 (중복 방지)
-            delta = current_text[len(last_text):] if len(current_text) > len(last_text) else ""
-            
-            # 3. 델타 품질 검증 및 정리
-            if delta and not stop_found:
-                # 델타 품질 검증
-                cleaned_delta = self._validate_and_clean_delta(delta)
-                if cleaned_delta:
-                    logger.info(f"델타 전송: '{cleaned_delta[:50]}...'")
-                    yield f"data: {json.dumps({'text': cleaned_delta})}\n\n"
-                    last_text = current_text  # 중요: 전송 후 업데이트
-                else:
-                    logger.warning(f"부적절한 델타 필터링: '{delta[:30]}...'")
-            
-            # 4. 종료 조건 체크
-            if stop_found:
-                logger.info("스톱 토큰으로 스트림 종료")
-                break
                 
-            # 5-1. 최대 토큰 수 체크
-            if len(current_text.split()) >= request.max_tokens:
-                logger.info(f"최대 토큰 수({request.max_tokens}) 도달로 스트림 종료")
-                break
+                # 안전한 출력 추출
+                try:
+                    if not request_output.outputs or len(request_output.outputs) == 0:
+                        logger.warning("빈 출력 감지, 건너뛰기")
+                        continue
+                        
+                    current_text = request_output.outputs[0].text
+                    if not isinstance(current_text, str):
+                        logger.error(f"비문자열 출력 감지: {type(current_text)}")
+                        continue
+                        
+                except (IndexError, AttributeError) as e:
+                    logger.error(f"출력 추출 오류: {e}")
+                    continue
                 
-            # 5-2. 문자 수 기반 종료 (모델 타입별) - 더 긴 응답 허용
-            max_chars = {
-                "autocomplete": 2000,   # 1000 → 2000
-                "prompt": 8000,        # 4000 → 8000 (더 긴 코드 생성)
-                "comment": 3000,       # 1500 → 3000
-                "error_fix": 6000      # 3000 → 6000
-            }.get(request.model_type, 4000)  # 기본값도 2000 → 4000
-            
-            if len(current_text) >= max_chars:
-                logger.info(f"문자 수 제한({max_chars}) 도달로 스트림 종료 (current={len(current_text)})")
-                break
-            
-            # 주기적인 진행 상황 로그
-            if token_count % 10 == 0:
-                logger.debug(f"진행 상황: tokens={token_count}, chars={len(current_text)}, max_chars={max_chars}")
-
-        # 정상 종료 시 완료 신호 전송
-        logger.info(f"스트리밍 정상 종료 - 완료 신호 전송 (token_count={token_count})")
-        yield f"data: {json.dumps({'type': 'done', 'text': ''})}\n\n"
+                token_count += 1
+                
+                # 1. 스톱 토큰 체크
+                stop_found = False
+                try:
+                    for stop_str in (config.stop or []):
+                        if stop_str and stop_str in current_text:
+                            current_text = current_text.split(stop_str)[0]
+                            stop_found = True
+                            logger.info(f"스톱 토큰 '{stop_str}' 감지됨")
+                            break
+                except Exception as e:
+                    logger.error(f"스톱 토큰 처리 오류: {e}")
+                
+                # 2. 안전한 델타 계산
+                try:
+                    if len(current_text) >= len(last_text):
+                        delta = current_text[len(last_text):]
+                    else:
+                        logger.warning("현재 텍스트가 이전보다 짧음, 델타 건너뛰기")
+                        delta = ""
+                except Exception as e:
+                    logger.error(f"델타 계산 오류: {e}")
+                    delta = ""
+                
+                # 3. 델타 품질 검증 및 전송
+                if delta and not stop_found:
+                    try:
+                        cleaned_delta = self._validate_and_clean_delta(delta)
+                        if cleaned_delta:
+                            # JSON 직렬화 안전성 강화
+                            json_data = json.dumps({'text': cleaned_delta}, ensure_ascii=False)
+                            yield f"data: {json_data}\n\n"
+                            last_text = current_text
+                            logger.debug(f"델타 전송 성공: {len(cleaned_delta)}자")
+                        else:
+                            logger.debug(f"델타 필터링됨: '{delta[:20]}...'")
+                    except Exception as e:
+                        logger.error(f"델타 처리 오류: {e}")
+                        continue
+                
+                # 4. 종료 조건 체크
+                if stop_found:
+                    logger.info("스톱 토큰으로 스트림 종료")
+                    break
+                    
+                # 5-1. 최대 토큰 수 체크
+                if len(current_text.split()) >= safe_max_tokens:
+                    logger.info(f"최대 토큰 수({safe_max_tokens}) 도달로 스트림 종료")
+                    break
+                    
+                # 5-2. 문자 수 기반 종료 (모델 타입별)
+                max_chars = {
+                    "autocomplete": 1500,   # 안전성 우선
+                    "prompt": 3000,        # 안전성 우선
+                    "comment": 1000,       # 안전성 우선
+                    "error_fix": 2000      # 안전성 우선
+                }.get(request.model_type, 2000)
+                
+                if len(current_text) >= max_chars:
+                    logger.info(f"문자 수 제한({max_chars}) 도달로 스트림 종료 (current={len(current_text)})")
+                    break
+                
+                # 주기적인 진행 상황 로그
+                if token_count % 10 == 0:
+                    logger.debug(f"진행 상황: tokens={token_count}, chars={len(current_text)}, max_chars={max_chars}")
+        
+        except Exception as e:
+            logger.error(f"스트리밍 루프 오류: {e}")
+            try:
+                error_data = json.dumps({"error": "스트리밍 오류 발생"}, ensure_ascii=False)
+                yield f"data: {error_data}\n\n"
+            except Exception:
+                yield "data: {\"error\": \"JSON 직렬화 오류\"}\n\n"
+        
+        finally:
+            # 항상 완료 신호 전송 (정상/비정상 종료 무관)
+            try:
+                logger.info(f"스트리밍 종료 - 완료 신호 전송 (token_count={token_count})")
+                completion_data = json.dumps({'type': 'done', 'text': ''}, ensure_ascii=False)
+                yield f"data: {completion_data}\n\n"
+            except Exception as e:
+                logger.error(f"완료 신호 전송 오류: {e}")
+                yield "data: {\"type\": \"done\", \"text\": \"\"}\n\n"
 
     async def generate_single(self, request: GenerateRequest) -> Dict[str, Any]:
         """단일 응답으로 텍스트를 생성합니다."""
@@ -408,7 +534,7 @@ Remember: Focus on robust, error-free solutions.
         return {'generated_text': full_text}
 
     def _validate_and_clean_delta(self, delta: str) -> str:
-        """델타 품질 검증 및 정리 (강화된 버전)"""
+        """안전하고 실용적인 델타 검증 (과도한 필터링 방지)"""
         if not delta or len(delta.strip()) == 0:
             return ""
         
@@ -417,46 +543,37 @@ Remember: Focus on robust, error-free solutions.
         # 1. 기본 정리
         cleaned = delta.strip()
         
-        # 2. 비인쇄 가능 문자 제거
-        cleaned = ''.join(c for c in cleaned if c.isprintable() or c.isspace())
-        
-        # 3. 중복 문자 패턴 제거
-        cleaned = re.sub(r'([a-zA-Z_])\1{2,}', r'\1', cleaned)  # 같은 문자 3개 이상 → 1개
-        cleaned = re.sub(r'([a-zA-Z_]{2,})\1+', r'\1', cleaned)  # 패턴 반복 제거
-        
-        # 4. 기그 문자 패턴 감지 및 차단
-        broken_patterns = [
-            r'[\x00-\x1f\x7f-\x9f]{2,}',  # 제어 문자
-            r'([a-zA-Z])\1{4,}',  # 5개 이상 반복
-            r'([a-zA-Z]{2,})\1{3,}',  # 패턴 4번 이상 반복
-            r'^[^a-zA-Z0-9\s\(\)\[\]\{\}\.,;:"\'\_\-\+\*\/\=\<\>\!\?\#\$\%\&\@\^\`\~\|\\]{3,}',  # 이상한 문자로만 구성
+        # 2. 심각한 손상만 차단 (영어 텍스트 허용)
+        severe_corruption_patterns = [
+            r'([a-zA-Z])\1{5,}',  # 같은 문자 6개 이상 반복
+            r'([a-zA-Z]{3,})\1{3,}',  # 패턴 4번 이상 반복
+            r'[a-zA-Z]{3,}[0-9]{3,}[a-zA-Z]{3,}[0-9]{3,}',  # 심각한 문자-숫자 혼재
         ]
         
-        for pattern in broken_patterns:
+        for pattern in severe_corruption_patterns:
             if re.search(pattern, cleaned):
-                logger.warning(f"기그 패턴 감지로 델타 차단: '{pattern}' in '{cleaned[:30]}...'")
-                return ""  # 기극 문자 감지 시 완전 차단
+                logger.warning(f"심각한 손상 패턴 감지: '{pattern}' in '{cleaned[:30]}...'")
+                return ""  # 심각한 손상만 차단
+        
+        # 3. 비인쇄 가능 문자 제거 (제어 문자만)
+        cleaned = ''.join(c for c in cleaned if c.isprintable() or c.isspace())
+        
+        # 4. 경미한 중복 패턴 제거 (안전한 정규식)
+        try:
+            # 같은 문자 3개 이상 반복만 제거
+            cleaned = re.sub(r'([a-zA-Z_])\1{2,}', r'\1\1', cleaned)
+        except re.error as e:
+            logger.warning(f"정규식 오류: {e}, 원본 텍스트 사용")
+            pass
         
         # 5. 최소 길이 체크
         if len(cleaned.strip()) < 1:
             return ""
-            
-        # 6. 의미 있는 내용 체크 (완화된 버전)
-        meaningful_chars = sum(1 for c in cleaned if c.isalnum() or c in '()[]{}.,;:"\'\_-+=<>!?#$%&@^`~|\\ \t\n')
-        total_chars = len(cleaned)
         
-        # 너무 짧은 델타는 통과
-        if total_chars <= 3:
+        # 6. 매우 관대한 검증 (거의 모든 텍스트 허용)
+        # 빈 문자열이 아니고 최소한의 내용이 있으면 통과
+        if len(cleaned.strip()) > 0:
+            logger.debug(f"델타 통과: '{cleaned[:30]}...' (길이: {len(cleaned)})")
             return cleaned
         
-        # 비율 계산 (공백 문자 포함)
-        if total_chars > 0:
-            ratio = meaningful_chars / total_chars
-            # 10% 이상이면 통과 (기존 30%에서 완화)
-            if ratio < 0.1:
-                logger.warning(f"의미 없는 델타 차단: meaningful_ratio={meaningful_chars}/{total_chars} = {ratio:.2f}")
-                return ""
-            else:
-                logger.debug(f"델타 통과: meaningful_ratio={meaningful_chars}/{total_chars} = {ratio:.2f}")
-        
-        return cleaned
+        return ""

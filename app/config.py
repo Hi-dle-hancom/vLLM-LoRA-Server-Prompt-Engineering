@@ -19,8 +19,8 @@ class ModelConfig:
     system_prompt: str
     stop: List[str] | None = None
 
-# 기본 모델 경로
-BASE_MODEL_PATH = "TheBloke/deepseek-coder-6.7B-instruct-AWQ"
+# 기본 모델 경로 (AWQ 양자화 모델 → 원본 모델로 변경)
+BASE_MODEL_PATH = "deepseek-ai/deepseek-coder-6.7b-instruct"  # 비양자화 원본 모델
 
 # 각 LoRA 어댑터별 설정
 MODEL_CONFIGS: Dict[str, ModelConfig] = {
